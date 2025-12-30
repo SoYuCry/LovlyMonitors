@@ -3,9 +3,52 @@
 import time
 import os
 from decimal import Decimal
+from functools import wraps
+from datetime import datetime, timezone, timedelta
 from web3 import Web3
 from dotenv import load_dotenv
 from utils.telegram_notify import TelegramNotifier
+
+# =======================
+# Retry Decorator
+# =======================
+
+def retry(max_attempts=3, delay=2, backoff=2, exceptions=(Exception,)):
+    """
+    重试装饰器
+    :param max_attempts: 最大重试次数
+    :param delay: 初始延迟时间(秒)
+    :param backoff: 延迟倍数(指数退避)
+    :param exceptions: 需要重试的异常类型
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            attempt = 0
+            current_delay = delay
+            while attempt < max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    attempt += 1
+                    if attempt >= max_attempts:
+                        print(f"❌ {func.__name__} 失败,已重试 {max_attempts} 次: {e}")
+                        raise
+                    print(f"⚠️  {func.__name__} 失败 (尝试 {attempt}/{max_attempts}), {current_delay}秒后重试: {e}")
+                    time.sleep(current_delay)
+                    current_delay *= backoff
+            return None
+        return wrapper
+    return decorator
+
+# =======================
+# Timezone Helper
+# =======================
+
+def get_beijing_time() -> str:
+    """获取北京时间 (UTC+8)"""
+    beijing_tz = timezone(timedelta(hours=8))
+    return datetime.now(beijing_tz).strftime("%Y-%m-%d %H:%M:%S")
 
 # =======================
 # Env / Telegram
@@ -94,6 +137,20 @@ def to_human(x: int) -> Decimal:
     return Decimal(x) / (Decimal(10) ** usd1_decimals)
 
 # =======================
+# Retry-wrapped functions
+# =======================
+
+@retry(max_attempts=3, delay=2, backoff=2)
+def fetch_market_data():
+    """获取市场数据(带重试)"""
+    return moolah.functions.market(MARKET_ID).call()
+
+@retry(max_attempts=3, delay=1, backoff=2)
+def send_telegram_message(message: str) -> bool:
+    """发送Telegram消息(带重试)"""
+    return notifier.send_message(message)
+
+# =======================
 # Main loop
 # =======================
 
@@ -104,14 +161,14 @@ last_above = False
 
 while True:
     try:
-        # ---- fetch on-chain state first ----
-        m = moolah.functions.market(MARKET_ID).call()
+        # ---- fetch on-chain state first (with retry) ----
+        m = fetch_market_data()
 
         supply = to_human(m[0])
         borrow = to_human(m[2])
         available = supply - borrow
 
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        ts = get_beijing_time()
         now = time.time()
 
         # ---- heartbeat ----
@@ -121,7 +178,7 @@ while True:
                 f"• 当前可借：{available:,.2f} USD1\n"
                 f"• 时间：{ts}"
             )
-            notifier.send_message(hb_msg)
+            send_telegram_message(hb_msg)
             last_heartbeat_ts = now
 
         # ---- threshold trigger ----
@@ -135,7 +192,7 @@ while True:
                 f"• 阈值：{THRESHOLD:,.0f}\n"
                 f"• 时间：{ts}"
             )
-            ok = notifier.send_message(msg)
+            ok = send_telegram_message(msg)
             if ok:
                 print(f"[{ts}] Telegram sent: {available:,.2f} USD1")
             else:
@@ -144,6 +201,6 @@ while True:
         last_above = is_above
 
     except Exception as exc:
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR:", exc)
+        print(f"[{get_beijing_time()}] ERROR:", exc)
 
     time.sleep(INTERVAL)

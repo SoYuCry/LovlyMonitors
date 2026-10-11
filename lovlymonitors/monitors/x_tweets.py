@@ -120,8 +120,18 @@ class XApiClient:
         }
         if since_id:
             params["since_id"] = since_id
-        data = self._get(f"{X_API_BASE_URL}/users/{user_id}/tweets", params=params)
-        return list(data.get("data") or [])
+        tweets: list[dict[str, Any]] = []
+        seen_tokens: set[str] = set()
+        while True:
+            data = self._get(f"{X_API_BASE_URL}/users/{user_id}/tweets", params=dict(params))
+            tweets.extend(data.get("data") or [])
+            token = (data.get("meta") or {}).get("next_token")
+            if not token:
+                return tweets
+            if token in seen_tokens:
+                raise XApiError("Repeated pagination token; refusing to advance stored cursor")
+            seen_tokens.add(token)
+            params["pagination_token"] = token
 
 
 class XTweetsMonitor:
@@ -175,6 +185,7 @@ def config_from_env(username: str) -> XMonitorConfig:
 
 
 def main() -> None:
+    load_dotenv()
     parser = argparse.ArgumentParser(description="Save latest X/Twitter posts for a username to local JSONL.")
     parser.add_argument("username", nargs="?", default=os.getenv("X_USERNAME"), help="X username, with or without @")
     args = parser.parse_args()

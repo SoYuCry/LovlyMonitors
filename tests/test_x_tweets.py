@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from lovlymonitors.monitors.x_tweets import (
     TweetJsonlStore,
     XApiClient,
     XApiError,
     normalize_username,
+    XMonitorConfig,
+    XTweetsMonitor,
+    main,
 )
 
 
@@ -41,6 +46,51 @@ class FakeSession:
 
 
 class XTweetsTests(unittest.TestCase):
+    def test_main_reads_dotenv_username_and_cli_override(self) -> None:
+        for argv, expected in [(["X_Monitor.py"], "jack"), (["X_Monitor.py", "other"], "other")]:
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as tmp:
+                env_file = Path(tmp) / ".env"
+                env_file.write_text("X_USERNAME=jack\nX_BEARER_TOKEN=test-token\n", encoding="utf-8")
+                from dotenv import load_dotenv
+                with patch.dict(os.environ, {}, clear=True), patch("sys.argv", argv), patch(
+                    "lovlymonitors.monitors.x_tweets.load_dotenv",
+                    side_effect=lambda: load_dotenv(env_file),
+                ), patch("lovlymonitors.monitors.x_tweets.XTweetsMonitor") as monitor:
+                    main()
+                    self.assertEqual(monitor.call_args.args[0].username, expected)
+                    monitor.return_value.run_forever.assert_called_once()
+
+    def test_pagination_keeps_since_id_and_reads_all_pages(self) -> None:
+        client = XApiClient("token", session=FakeSession())
+        with patch.object(client, "_get", side_effect=[
+            {"data": [{"id": "103"}], "meta": {"next_token": "page2"}},
+            {"data": [{"id": "101"}, {"id": "102"}]},
+        ]) as get:
+            self.assertEqual(len(client.latest_tweets("12", since_id="100")), 3)
+            self.assertNotIn("pagination_token", get.call_args_list[0].kwargs["params"])
+            self.assertEqual(get.call_args_list[1].kwargs["params"]["pagination_token"], "page2")
+            self.assertEqual(get.call_args_list[1].kwargs["params"]["since_id"], "100")
+
+    def test_failed_page_does_not_advance_store_then_retry_saves_all(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor = XTweetsMonitor(XMonitorConfig("jack", "token", Path(tmp)))
+            monitor.user_id = "12"
+            monitor.store.append_new([{"id": "100"}])
+            first = {"data": [{"id": "103"}], "meta": {"next_token": "page2"}}
+            with patch.object(monitor.client, "_get", side_effect=[first, XApiError("failed")]):
+                with self.assertRaises(XApiError):
+                    monitor.tick()
+            self.assertEqual(TweetJsonlStore(monitor.store.path).newest_id(), "100")
+            with patch.object(monitor.client, "_get", side_effect=[first, {"data": [{"id": "101"}, {"id": "102"}]}]):
+                self.assertEqual([t["id"] for t in monitor.tick()], ["101", "102", "103"])
+
+    def test_repeated_pagination_token_fails(self) -> None:
+        client = XApiClient("token", session=FakeSession())
+        with patch.object(client, "_get", return_value={"meta": {"next_token": "same"}}) as get:
+            with self.assertRaises(XApiError):
+                client.latest_tweets("12")
+            self.assertEqual(get.call_count, 2)
+
     def test_normalize_username(self) -> None:
         self.assertEqual(normalize_username(" @jack "), "jack")
         self.assertEqual(normalize_username("user_123"), "user_123")
